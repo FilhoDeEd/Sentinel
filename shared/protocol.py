@@ -2,26 +2,30 @@ from pprint import pprint
 
 
 import re
-import struct
 import json
+import struct
 from dataclasses import dataclass, asdict
 from datetime import datetime
-from typing import Any, ClassVar, Dict, Optional
+from typing import Any, ClassVar, Dict, Optional, Pattern
 
 
-ID_PATTERN = re.compile(r'^[a-z0-9]{7}$')
+ID_PATTERN: Pattern[str] = re.compile(r'^[a-z0-9]{7}$')
 
-HEADER_FORMAT = '!B1sI7s'
-HEADER_SIZE = struct.calcsize(HEADER_FORMAT)
+HEADER_FORMAT: str = '!B1sI7s'
+HEADER_SIZE: int = struct.calcsize(HEADER_FORMAT)
+
+ENCODING: str = 'utf-8'
+DATETIME_FORMAT: str = '%Y%m%d%H%M'
 
 
-ENCODING = 'utf-8'
-DATETIME_FORMAT = '%Y%m%d%H%M'
+class UnknownAliasError(Exception):
+    def __init__(self, alias: str):
+        super().__init__(f'Unknown alias encountered: {alias!r}')
+        self.alias = alias
 
 
 @dataclass
 class HostStatus:
-    host_id: str
     timestamp: datetime
     host_name: Optional[str] = None
     ram_total: Optional[float] = None
@@ -31,10 +35,8 @@ class HostStatus:
     cpu_temperature: Optional[float] = None
     disk_usage: Optional[float] = None
     disk_total: Optional[float] = None
-    uptime: Optional[int] = None
 
     FIELD_ALIAS: ClassVar[Dict[str, str]] = {
-        'host_id': 'HID',
         'timestamp': 'TMS',
         'host_name': 'HNM',
         'ram_total': 'RTT',
@@ -43,49 +45,51 @@ class HostStatus:
         'cpu_usage': 'CUG',
         'cpu_temperature': 'CTP',
         'disk_total': 'DTT',
-        'disk_usage': 'DUG',
-        'uptime': 'UPT',
+        'disk_usage': 'DUG'
     }
 
     @staticmethod
     def serialize(host_status: 'HostStatus') -> bytes:
-        annotations: Dict[str, Any] = HostStatus.__annotations__
+        field_types: Dict[str, Any] = HostStatus.__annotations__
+
         data: Dict[str, Any] = {}
 
-        for attr, value in asdict(host_status).items():
-            if value is not None:
-                attr_type: Any = annotations[attr]
+        for field_name, field_value in asdict(host_status).items():
+            if field_value is not None:
+                field_type: Any = field_types[field_name]
 
-                if attr_type == datetime or attr_type == Optional[datetime]:
-                    value = value.strftime(DATETIME_FORMAT)
+                if field_type == datetime or field_type == Optional[datetime]:
+                    field_value = field_value.strftime(DATETIME_FORMAT)
 
-                if attr_type == float or attr_type == Optional[float]:
-                    value = round(value, 3)
+                if field_type == float or field_type == Optional[float]:
+                    field_value = round(field_value, 3)
 
-                data[HostStatus.FIELD_ALIAS[attr]] = value
+                data[HostStatus.FIELD_ALIAS[field_name]] = field_value
 
         return json.dumps(data).encode(ENCODING)
 
     @staticmethod
-    def deserialize(data: bytes) -> 'HostStatus':
-        pass
+    def deserialize(serialized_host_status: bytes) -> 'HostStatus':
+        field_types: Dict[str, Any] = HostStatus.__annotations__
+        alias_to_field: Dict[str, str] = {value: key for key, value in HostStatus.FIELD_ALIAS.items()}
 
+        data: Dict[str, Any] = json.loads(serialized_host_status.decode(ENCODING))
+        kwargs: Dict[str, Any] = {}
 
+        for field_alias, field_value in data.items():
+            field_name: Optional[str] = alias_to_field.get(field_alias)
 
-status = HostStatus(
-    host_id="abc1234",
-    timestamp=datetime(2023, 1, 3, 3, 58),
-    ram_total=16.029413,
-    ram_usage=8.5,
-    cpu_total=8,
-    cpu_usage=45.3,
-    cpu_temperature=65.2,
-    disk_usage=100.0,
-    disk_total=50.0,
-    uptime=3600
-)
+            if not field_name:
+                raise UnknownAliasError(field_alias)
 
-print(HostStatus.serialize(status))
+            field_type: Any = field_types[field_name]
+
+            if field_type == datetime or field_type == Optional[datetime]:
+                field_value = datetime.strptime(field_value, DATETIME_FORMAT)
+
+            kwargs[field_name] = field_value
+
+        return HostStatus(**kwargs)
 
 
 def parse_status_update(message: str) -> HostStatus | None:
