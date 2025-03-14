@@ -4,16 +4,17 @@ import struct
 from dataclasses import dataclass, asdict
 from datetime import datetime
 from enum import StrEnum
-from typing import Any, ClassVar, Dict, List, Optional, Pattern, Tuple
+from typing import Any, ClassVar, Dict, List, NamedTuple, Optional, Pattern, Tuple, Type
 
 
 DATETIME_FORMAT: str = '%Y%m%d%H%M'
 ENCODING: str = 'utf-8'
-HEADER_FORMAT: str = '!B1sI7s'
+HEADER_FORMAT: str = '!B7s12s1sI'
 HEADER_SIZE: int = struct.calcsize(HEADER_FORMAT)
 HOST_ID_PATTERN: Pattern[str] = re.compile(r'^[a-z0-9]{7}$')
 MSG_TYPE_PATTERN: Pattern[str] = re.compile(r'^[A-Z]{1}$')
 PROTOCOL_VERSION: int = 1
+TIMESTAMP_PATTERN: Pattern[str] = re.compile(r'^\d{12}$')
 
 
 class MessageTypes(StrEnum):
@@ -41,34 +42,40 @@ class IncompletePacketError(Exception):
         self.expected_size = expected_size
 
 
-def pack(host_id: str, msg_type: str, payload: bytes) -> bytes:
+def pack(host_id: str, timestamp: datetime, msg_type: str, payload: bytes) -> bytes:
     if not HOST_ID_PATTERN.match(host_id):
         raise ValueError(f'Invalid host_id pattern: {host_id}')
 
     if not MSG_TYPE_PATTERN.match(msg_type):
         raise ValueError(f'Invalid msg_type pattern: {msg_type}')
 
-    header: bytes = struct.pack(HEADER_FORMAT, PROTOCOL_VERSION, msg_type.encode(ENCODING), len(payload), host_id.encode(ENCODING))
+    encoded_host_id: bytes = host_id.encode(ENCODING)
+    formatted_timestamp: bytes = timestamp.strftime(DATETIME_FORMAT).encode(ENCODING)
+    encoded_msg_type: bytes = msg_type.encode(ENCODING)
+    payload_size: int = len(payload)
+
+    header: bytes = struct.pack(HEADER_FORMAT, PROTOCOL_VERSION, encoded_host_id, formatted_timestamp, encoded_msg_type, payload_size)
 
     return header + payload
 
 
-def unpack(packet: bytes) -> Tuple[int, str, int, str, bytes]:
+def unpack(packet: bytes) -> Tuple[int, str, datetime, str, int, bytes]:
     if len(packet) < HEADER_SIZE:
         raise IncompletePacketError(len(packet), HEADER_SIZE)
 
-    version, msg_type, payload_size, host_id = struct.unpack(HEADER_FORMAT, packet[:HEADER_SIZE])
-    msg_type = msg_type.decode(ENCODING).strip()
-    host_id = host_id.decode(ENCODING).strip()
+    version, encoded_host_id, formatted_timestamp, encoded_msg_type, payload_size = struct.unpack(HEADER_FORMAT, packet[:HEADER_SIZE])
+
+    host_id: str = encoded_host_id.decode(ENCODING).strip()
+    timestamp: datetime = datetime.strptime(DATETIME_FORMAT, formatted_timestamp.decode(ENCODING))
+    msg_type: str = encoded_msg_type.decode(ENCODING).strip()
 
     payload = packet[HEADER_SIZE:HEADER_SIZE + payload_size]
 
-    return version, msg_type, payload_size, host_id, payload
+    return version, host_id, timestamp, msg_type, payload_size, payload
 
 
 @dataclass
 class HostStatus:
-    timestamp: datetime
     host_name: Optional[str] = None
     ram_total: Optional[float] = None
     ram_usage: Optional[float] = None
