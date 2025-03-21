@@ -38,7 +38,7 @@ class UnknownFieldNameError(Exception):
 
 class UnknownMessageTypeError(Exception):
     def __init__(self, msg_type: str):
-        super().__init__(f'Unknown  message type: {msg_type!r}.')
+        super().__init__(f'Unknown message type: {msg_type!r}.')
         self.msg_type = msg_type
 
 
@@ -61,6 +61,9 @@ def pack(host_id: str, timestamp: datetime, msg_type: str, payload: bytes) -> by
 
     if not MSG_TYPE_PATTERN.match(msg_type):
         raise ValueError(f'Invalid msg_type pattern: {msg_type}')
+
+    if not msg_type in MessageTypes._member_map_.values():
+        raise UnknownMessageTypeError(msg_type)
 
     encoded_host_id: bytes = host_id.encode(ENCODING)
     formatted_timestamp: bytes = timestamp.strftime(DATETIME_FORMAT).encode(ENCODING)
@@ -110,7 +113,7 @@ class Status:
     }
 
     def __post_init__(self):
-        for field in fields(self):
+        for field in fields(Status):
             field_value: Any = getattr(self, field.name)
             expected_type: Any = field.type
             expected_args: Tuple[Any] = get_args(expected_type)
@@ -184,7 +187,7 @@ class Request:
                 raise UnknownFieldNameError(field_name)
 
     def serialize(self) -> bytes:
-        return b' '.join(Request.FIELD_ALIAS[field_name].encode(ENCODING) for field_name in self.requested_fields)
+        return b' '.join([Request.FIELD_ALIAS[field_name].encode(ENCODING) for field_name in self.requested_fields])
 
     @staticmethod
     def deserialize(serialized_request: bytes) -> 'Request':
@@ -214,7 +217,7 @@ def create_status_packet(host_id: str, timestamp: datetime, status: Status) -> b
     return pack(host_id=host_id, timestamp=timestamp, msg_type=MessageTypes.STATUS, payload=status.serialize())
 
 
-def parse_packet(packet: bytes):
+def parse_packet(packet: bytes) -> Union[Status, Request, None]:
     version, host_id, timestamp, msg_type, payload_size, payload = unpack(packet)
 
     match msg_type:
@@ -223,6 +226,6 @@ def parse_packet(packet: bytes):
         case MessageTypes.REQUEST:
             return Request.deserialize(payload)
         case MessageTypes.ACK:
-            pass
+            return None
         case _:
             raise UnknownMessageTypeError(msg_type)
