@@ -1,10 +1,10 @@
 import json
 import re
 import struct
-from dataclasses import dataclass, asdict
+from dataclasses import asdict, dataclass, fields
 from datetime import datetime
 from enum import StrEnum
-from typing import Any, ClassVar, Dict, List, NamedTuple, Optional, Pattern, Tuple, Type
+from typing import Any, ClassVar, Dict, List, Optional, Pattern, Tuple, Union, get_args, get_origin
 
 
 DATETIME_FORMAT: str = '%Y%m%d%H%M'
@@ -17,10 +17,11 @@ PROTOCOL_VERSION: int = 1
 TIMESTAMP_PATTERN: Pattern[str] = re.compile(r'^\d{12}$')
 
 
-class MessageTypes(StrEnum):
-    STATUS = 'S'
-    REQUEST = 'R'
-    ACK = 'A'
+class IncompletePacketError(Exception):
+    def __init__(self, packet_size: int, expected_size: int):
+        super().__init__(f'Packet too small: received {packet_size} bytes, but expected at least {expected_size} bytes.')
+        self.packet_size = packet_size
+        self.expected_size = expected_size
 
 
 class UnknownAliasError(Exception):
@@ -35,11 +36,23 @@ class UnknownFieldNameError(Exception):
         self.field_name = field_name
 
 
-class IncompletePacketError(Exception):
-    def __init__(self, packet_size: int, expected_size: int):
-        super().__init__(f'Packet too small: received {packet_size} bytes, but expected at least {expected_size} bytes.')
-        self.packet_size = packet_size
-        self.expected_size = expected_size
+class UnknownMessageTypeError(Exception):
+    def __init__(self, msg_type: str):
+        super().__init__(f'Unknown  message type: {msg_type!r}.')
+        self.msg_type = msg_type
+
+
+class MessageTypes(StrEnum):
+    STATUS = 'S'
+    REQUEST = 'R'
+    ACK = 'A'
+
+
+def is_optional_type(type_: Any) -> bool:
+    origin: Optional[Any] = get_origin(type_)
+    args: Tuple[Any] = get_args(type_)
+
+    return origin is Union and len(args) == 2 and type(None) in args
 
 
 def pack(host_id: str, timestamp: datetime, msg_type: str, payload: bytes) -> bytes:
@@ -66,7 +79,7 @@ def unpack(packet: bytes) -> Tuple[int, str, datetime, str, int, bytes]:
     version, encoded_host_id, formatted_timestamp, encoded_msg_type, payload_size = struct.unpack(HEADER_FORMAT, packet[:HEADER_SIZE])
 
     host_id: str = encoded_host_id.decode(ENCODING).strip()
-    timestamp: datetime = datetime.strptime(DATETIME_FORMAT, formatted_timestamp.decode(ENCODING))
+    timestamp: datetime = datetime.strptime(formatted_timestamp.decode(ENCODING), DATETIME_FORMAT)
     msg_type: str = encoded_msg_type.decode(ENCODING).strip()
 
     payload = packet[HEADER_SIZE:HEADER_SIZE + payload_size]
@@ -75,7 +88,7 @@ def unpack(packet: bytes) -> Tuple[int, str, datetime, str, int, bytes]:
 
 
 @dataclass
-class HostStatus:
+class Status:
     host_name: Optional[str] = None
     ram_total: Optional[float] = None
     ram_usage: Optional[float] = None
@@ -86,7 +99,6 @@ class HostStatus:
     disk_total: Optional[float] = None
 
     FIELD_ALIAS: ClassVar[Dict[str, str]] = {
-        'timestamp': 'TMS',
         'host_name': 'HNM',
         'ram_total': 'RTT',
         'ram_usage': 'RUG',
@@ -97,8 +109,27 @@ class HostStatus:
         'disk_usage': 'DUG'
     }
 
+    def __post_init__(self):
+        for field in fields(self):
+            field_value: Any = getattr(self, field.name)
+            expected_type: Any = field.type
+            expected_args: Tuple[Any] = get_args(expected_type)
+
+            if field_value is None:
+                if type(None) not in expected_args:
+                    raise ValueError(f'The field {field.name!r} cannot be None.')
+            else:
+                if is_optional_type(expected_type):
+                    expected_type = expected_args[0]
+
+                if not isinstance(field_value, expected_type):
+                    raise TypeError(
+                        f"The field {field.name!r} must be of type '{expected_type}'. "
+                        f"Received: '{type(field_value)}'."
+                    )
+
     def serialize(self) -> bytes:
-        field_types: Dict[str, Any] = HostStatus.__annotations__
+        field_types: Dict[str, Any] = {field.name: field.type for field in fields(Status)}
 
         data: Dict[str, Any] = {}
 
@@ -106,22 +137,22 @@ class HostStatus:
             if field_value is not None:
                 field_type: Any = field_types[field_name]
 
-                if field_type == datetime or field_type == Optional[datetime]:
+                if field_type == datetime or (is_optional_type(field_type) and datetime in get_args(field_type)):
                     field_value = field_value.strftime(DATETIME_FORMAT)
 
-                if field_type == float or field_type == Optional[float]:
+                if field_type == float or (is_optional_type(field_type) and float in get_args(field_type)):
                     field_value = round(field_value, 3)
 
-                data[HostStatus.FIELD_ALIAS[field_name]] = field_value
+                data[Status.FIELD_ALIAS[field_name]] = field_value
 
         return json.dumps(data, separators=(',', ':')).encode(ENCODING)
 
     @staticmethod
-    def deserialize(serialized_host_status: bytes) -> 'HostStatus':
-        field_types: Dict[str, Any] = HostStatus.__annotations__
-        alias_to_field: Dict[str, str] = {value: key for key, value in HostStatus.FIELD_ALIAS.items()}
+    def deserialize(serialized_status: bytes) -> 'Status':
+        field_types: Dict[str, Any] = {field.name: field.type for field in fields(Status)}
+        alias_to_field: Dict[str, str] = {value: key for key, value in Status.FIELD_ALIAS.items()}
 
-        data: Dict[str, Any] = json.loads(serialized_host_status.decode(ENCODING))
+        data: Dict[str, Any] = json.loads(serialized_status.decode(ENCODING))
         kwargs: Dict[str, Any] = {}
 
         for field_alias, field_value in data.items():
@@ -132,33 +163,66 @@ class HostStatus:
 
             field_type: Any = field_types[field_name]
 
-            if field_type == datetime or field_type == Optional[datetime]:
+            if field_type == datetime or (is_optional_type(field_type) and datetime in get_args(field_type)):
                 field_value = datetime.strptime(field_value, DATETIME_FORMAT)
 
             kwargs[field_name] = field_value
 
-        return HostStatus(**kwargs)
+        return Status(**kwargs)
 
 
-def create_status_packet(host_id: str, host_status: HostStatus) -> bytes:
-    return pack(host_id=host_id, msg_type=MessageTypes.STATUS, payload=host_status.serialize())
+@dataclass
+class Request:
+    requested_fields: List[str]
+
+    FIELD_ALIAS: ClassVar[Dict[str, str]] = Status.FIELD_ALIAS
+
+    def __post_init__(self):
+        valid_field_names = list(Request.FIELD_ALIAS.keys())
+        for field_name in self.requested_fields:
+            if field_name not in valid_field_names:
+                raise UnknownFieldNameError(field_name)
+
+    def serialize(self) -> bytes:
+        return b' '.join(Request.FIELD_ALIAS[field_name].encode(ENCODING) for field_name in self.requested_fields)
+
+    @staticmethod
+    def deserialize(serialized_request: bytes) -> 'Request':
+        alias_to_field: Dict[str, str] = {value: key for key, value in Request.FIELD_ALIAS.items()}
+        request_fields: List[str] = []
+
+        for field_alias in serialized_request.decode(ENCODING).strip().split(' '):
+            field_name: Optional[str] = alias_to_field.get(field_alias)
+
+            if not field_name:
+                raise UnknownAliasError(field_alias)
+
+            request_fields.append(field_name)
+
+        return Request(request_fields)
 
 
-def create_acknowledge_packet(host_id: str) -> bytes:
-    return pack(host_id=host_id, msg_type=MessageTypes.ACK, payload=b'')
+def create_acknowledge_packet(host_id: str, timestamp: datetime) -> bytes:
+    return pack(host_id=host_id, timestamp=timestamp, msg_type=MessageTypes.ACK, payload=b'')
 
 
-def create_request_packet(host_id: str, request_fields: List[str]):
-    payload: bytes = b''
-
-    for field_name in request_fields:
-        field_alias: Optional[str] = HostStatus.FIELD_ALIAS.get(field_name)
-
-        if not field_alias:
-            raise UnknownAliasError(field_name)
-        
-        payload += field_alias.encode(ENCODING)
-
-    return pack(host_id=host_id, msg_type=MessageTypes.REQUEST, payload=payload)
+def create_request_packet(host_id: str, timestamp: datetime, request: Request) -> bytes:
+    return pack(host_id=host_id, timestamp=timestamp, msg_type=MessageTypes.REQUEST, payload=request.serialize())
 
 
+def create_status_packet(host_id: str, timestamp: datetime, status: Status) -> bytes:
+    return pack(host_id=host_id, timestamp=timestamp, msg_type=MessageTypes.STATUS, payload=status.serialize())
+
+
+def parse_packet(packet: bytes):
+    version, host_id, timestamp, msg_type, payload_size, payload = unpack(packet)
+
+    match msg_type:
+        case MessageTypes.STATUS:
+            return Status.deserialize(payload)
+        case MessageTypes.REQUEST:
+            return Request.deserialize(payload)
+        case MessageTypes.ACK:
+            pass
+        case _:
+            raise UnknownMessageTypeError(msg_type)
